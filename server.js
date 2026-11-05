@@ -1,10 +1,11 @@
+
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
@@ -18,6 +19,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+if (!process.env.SUPABASE_URL ||
+    !process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    !process.env.JWT_SECRET) {
+  throw new Error("Missing required environment variables.");
+}
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -29,19 +41,7 @@ app.get("/api/health", (req, res) => {
   res.json({ success: true, status: "online" });
 });
 
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log("MongoDB connected"))
-  .catch(error => console.error("MongoDB connection error:", error.message));
-
-const UserSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  phone: { type: String, required: true },
-  password: { type: String, required: true }
-}, { timestamps: true });
-
-const User = mongoose.model("User", UserSchema);
-
+// REGISTER
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { fullName, email, phone, password } = req.body;
@@ -62,9 +62,14 @@ app.post("/api/auth/register", async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const existingUser = await User.findOne({
-      email: normalizedEmail
-    });
+    const { data: existingUser, error: lookupError } =
+      await supabase
+        .from("users")
+        .select("id")
+        .eq("email", normalizedEmail)
+        .maybeSingle();
+
+    if (lookupError) throw lookupError;
 
     if (existingUser) {
       return res.status(409).json({
@@ -73,21 +78,27 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const passwordHash = await bcrypt.hash(password, 12);
 
-    const user = await User.create({
-      fullName: fullName.trim(),
-      email: normalizedEmail,
-      phone: phone.trim(),
-      password: hashedPassword
-    });
+    const { data: user, error } = await supabase
+      .from("users")
+      .insert({
+        full_name: fullName.trim(),
+        email: normalizedEmail,
+        phone: phone.trim(),
+        password_hash: passwordHash
+      })
+      .select("id, full_name, email, phone")
+      .single();
+
+    if (error) throw error;
 
     return res.status(201).json({
       success: true,
       message: "Account created successfully.",
       user: {
-        id: user._id,
-        fullName: user.fullName,
+        id: user.id,
+        fullName: user.full_name,
         email: user.email,
         phone: user.phone
       }
@@ -103,6 +114,7 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
+// LOGIN
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -114,23 +126,23 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      email: email.trim().toLowerCase()
-    });
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, full_name, email, phone, password_hash")
+      .eq("email", email.trim().toLowerCase())
+      .maybeSingle();
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    if (error) throw error;
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password."
       });
     }
 
-    if (!process.env.JWT_SECRET) {
-      throw new Error("JWT_SECRET is not configured.");
-    }
-
     const token = jwt.sign(
-      { userId: user._id },
+      { userId: user.id },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
@@ -140,8 +152,8 @@ app.post("/api/auth/login", async (req, res) => {
       message: "Login successful.",
       token,
       user: {
-        id: user._id,
-        fullName: user.fullName,
+        id: user.id,
+        fullName: user.full_name,
         email: user.email,
         phone: user.phone
       }
